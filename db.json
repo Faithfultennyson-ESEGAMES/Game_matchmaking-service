@@ -1,5 +1,16 @@
 {
-  "queue": [],
+  "queue": {
+    "dice": {
+      "2": [],
+      "4": [],
+      "6": [],
+      "15": []
+    },
+    "tictactoe": {
+      "2": []
+    }
+  },
   "active_games": {},
-  "ended_games": {}
+  "ended_games": {},
+  "rate_limit": {}
 }
