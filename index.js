@@ -196,7 +196,7 @@ async function createSessionForMatch(gameType, mode) {
     const url = gameType === 'dice' ? DICE_GAME_SERVER_URL : TICTACTOE_GAME_SERVER_URL;
     const body =
         gameType === 'dice'
-            ? { minPlayers: mode, maxPlayers: mode, turnTimeMs: DICE_TURN_TIME_MS }
+            ? { playerCount: mode, turnTimeMs: DICE_TURN_TIME_MS }
             : { turnDurationSec: TICTACTOE_TURN_DURATION_SEC };
 
     for (let attempt = 1; attempt <= MAX_SESSION_CREATION_ATTEMPTS; attempt++) {
