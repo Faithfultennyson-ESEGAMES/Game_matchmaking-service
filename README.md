@@ -1,18 +1,18 @@
 # Matchmaking Server for ESEGAMES
 
-This Node.js application is the central matchmaking service for the ESEGAMES platform. It manages a player queue, forms matches, and communicates with the `game-server` to create game sessions. It maintains a simple state of the player queue and active games using a local JSON file (`db.json`).
+This Node.js application is the central matchmaking service for the ESEGAMES platform. It manages a player queue, forms matches, and communicates with the `game-server` to create game sessions. It stores queue and session state in Redis with TTL-based cleanup.
 
 ## High-Level Workflow
 
 1.  **Client Connection**: A player connects to this server via Socket.IO.
-2.  **Match Request**: The client emits a `request-match` event with `playerId`, `playerName`, `gameType`, and `mode`.
-3.  **Queuing**: The player is added to a queue. If two players are present, a match is formed.
-4.  **Session Creation**: The server sends a signed, server-to-server `POST` request to the appropriate game server (`dice` or `tictactoe`) `/start` endpoint using the selected mode.
+2.  **Match Request**: The client emits a `request-match` event with `playerId`, `playerName`, `gameType`, and `mode` (plus optional `deviceId`).
+3.  **Queuing**: The player is added to a queue. When the required number of players for that mode is present, a match is formed.
+4.  **Session Creation**: The server sends a signed, server-to-server `POST` request to the appropriate game server (`dice`, `tictactoe`, or `card`) `/start` endpoint using the selected mode. For dice/card, the payload includes `playerCount`.
 5.  **Receive Game Details**: The `game-server` responds with a `sessionId` and a `joinUrl`. This response is verified using a shared HMAC secret.
 6.  **Notify Players**: The server emits a `match-found` event to both players, providing the `sessionId` and `joinUrl`.
 7.  **Client Redirect**: The clients construct the final game URL using the received data and redirect the players to the game client.
 8.  **Session Closure**: After the game ends, the `game-server` sends a `POST /session-closed` webhook back to this server.
-9.  **State Cleanup**: This server validates the webhook, removes the players from the active games list, and emits a `session-ended` event to notify the clients they can play again.
+9.  **State Cleanup**: This server validates the webhook, removes the players from the active games list, and emits a `session-ended` event to notify the clients (including win/loss/draw).
 
 ---
 
@@ -42,6 +42,9 @@ DICE_GAME_SERVER_URL=http://localhost:3001
 # TicTacToe game-server URL (e.g., http://localhost:5500).
 TICTACTOE_GAME_SERVER_URL=http://localhost:5500
 
+# Card game-server URL (e.g., http://localhost:3000).
+CARD_GAME_SERVER_URL=http://localhost:3000
+
 # The shared password for authenticating with the game-server's protected endpoints.
 # This MUST match the DLQ_PASSWORD in the game-server's .env file.
 DLQ_PASSWORD=your_strong_secret_password
@@ -50,17 +53,34 @@ DLQ_PASSWORD=your_strong_secret_password
 # This MUST match the HMAC_SECRET in the game-server's .env file.
 HMAC_SECRET=your_very_strong_hmac_secret
 
+# --- Redis settings (required) ---
+# Provide either REDIS_URL, or REDIS_HOST + REDIS_PORT + credentials.
+# If your Redis provider uses ACLs, set REDIS_USERNAME.
+REDIS_HOST=redis-18324.c341.af-south-1-1.ec2.cloud.redislabs.com
+REDIS_PORT=18324
+REDIS_USERNAME=your_redis_username
+REDIS_PASSWORD=your_redis_password
+REDIS_USE_TLS=true
+
 # --- Optional Settings ---
 MAX_SESSION_CREATION_ATTEMPTS=3
 SESSION_CREATION_RETRY_DELAY_MS=1500
 DB_ENTRY_TTL_MS=3600000
+ACTIVE_GAMES_TTL_MS=3600000
+
+# --- Private Lobby Settings ---
+PRIVATE_LOBBY_IDLE_MS=1800000
+PRIVATE_LOBBY_EMPTY_GRACE_MS=60000
 
 # --- Per-game Turn Timers ---
 # Dice /start expects turnTimeMs
 DICE_TURN_TIME_MS=8000
 
 # TicTacToe /start expects turnDurationSec
-TICTACTOE_TURN_DURATION_SEC=10
+TICTACTOE_TURN_DURATION_SEC=6
+
+# Card /start expects turnDurationSec
+CARD_TURN_DURATION_SEC=12
 
 # --- Queue Cooldown (cancel/join spam protection) ---
 CANCEL_JOIN_WINDOW_MS=300000
@@ -79,7 +99,7 @@ node index.js
 
 ## Client Integration Guide
 
-Clients must use Socket.IO to connect and interact with this server.
+Clients must use Socket.IO to connect and interact with this server. For a deeper, app-focused walkthrough, see `matchmaking-server/INTEGRATION.md`.
 
 ### 1. Connect and Request a Match
 
@@ -91,15 +111,22 @@ const socket = io("https://tictac-toematchmaking-service-production.up.railway.a
 const playerDetails = {
     playerId: 'user-12345-abcdef', // A unique, stable identifier
     playerName: 'RizzoTheRat',     // Display name
-    gameType: 'dice',              // 'dice' or 'tictactoe'
-    mode: 4                        // dice modes: 2/4/6/15 (tictactoe always 2)
+    gameType: 'dice',              // 'dice', 'tictactoe', or 'card'
+    mode: 4,                       // dice: 2/4/6/15, card: 2-6, tictactoe always 2
+    deviceId: 'device-uuid'        // Optional: per-device identifier for rate limiting
 };
 
 socket.emit('request-match', playerDetails);
 ```
 
-Dice modes supported: `2`, `4`, `6`, `15`. TicTacToe always uses mode `2`.
-For TicTacToe requests, `mode` is optional and will be forced to `2`.
+Dice modes supported: `2`, `4`, `6`, `15`.
+Card modes supported: `2`, `3`, `4`, `5`, `6`.
+TicTacToe always uses mode `2` (mode is optional and forced to `2`).
+
+When creating sessions:
+- Dice: `{ playerCount: <mode>, turnTimeMs: DICE_TURN_TIME_MS }`
+- TicTacToe: `{ turnDurationSec: TICTACTOE_TURN_DURATION_SEC }`
+- Card: `{ playerCount: <mode>, turnDurationSec: CARD_TURN_DURATION_SEC }`
 
 ### Queue behavior and overflow
 
@@ -149,15 +176,15 @@ The cooldown triggers after a player cancels/joins the queue more than `MAX_CANC
 **`cancel-match`**: Client request to leave any queue (also used when switching modes).
 
 ```javascript
-socket.emit('cancel-match', { playerId: 'user-12345-abcdef' });
+socket.emit('cancel-match', { playerId: 'user-12345-abcdef', deviceId: 'device-uuid' });
 ```
 
 **`session-ended`**: The game has officially concluded. The user is now free to request a new match.
 
 ```javascript
 socket.on('session-ended', (data) => {
-    console.log(`Session ${data.sessionId} has ended.`);
-    // data = { sessionId: "..." }
+    console.log(`Session ${data.sessionId} has ended (${data.outcome}).`);
+    // data = { sessionId: "...", outcome: "win" | "loss" | "draw" }
 
     // Update the UI to allow the user to start a new match search.
 });
@@ -167,7 +194,7 @@ socket.on('session-ended', (data) => {
 
 ```javascript
 socket.on('queue-status', (data) => {
-    // data = { dice: { 2: 1, 4: 3, 6: 0, 15: 0 }, tictactoe: { 2: 2 } }
+    // data = { dice: { 2: 1, 4: 3, 6: 0, 15: 0 }, tictactoe: { 2: 2 }, card: { 2: 0, 3: 1, 4: 0, 5: 0, 6: 0 } }
 });
 ```
 
@@ -185,8 +212,8 @@ socket.on('queue-cancelled', (data) => {
 
 Common errors:
 
-- `Invalid gameType. Use dice or tictactoe.` (unknown game type)
-- `Invalid mode. Dice modes: 2, 4, 6, 15.` (invalid mode)
+- `Invalid gameType. Use dice, tictactoe, or card.` (unknown game type)
+- `Invalid mode. Dice: 2,4,6,15. Card: 2-6.` (invalid mode)
 - `playerId and playerName are required.` (missing required fields)
 - `Cooldown active. Please wait before re-queueing.` (rate limit triggered)
 - `Could not create game session.` (game server `/start` failed after retries)
@@ -195,8 +222,10 @@ Common errors:
 ### Rate limit / cooldown policy
 
 - Each `request-match` and `cancel-match` counts toward the same rolling window.
+- Rate limiting keys include playerId, IP (from `X-Forwarded-For` when present), optional deviceId, and a combined key.
 - If a player exceeds `MAX_CANCEL_JOIN` actions within `CANCEL_JOIN_WINDOW_MS`, the server blocks new queue requests until `COOLDOWN_MS` passes.
 - During cooldown, the server responds with `match-error` and includes `cooldownUntil` (epoch ms).
+- Once a match is found, the rate limit entries are reset for that player/IP/device combination.
 
 ### 3. Handling Invalid Sessions (Client-Side Recovery)
 
@@ -226,6 +255,73 @@ socket.on('session-cleared', () => {
     // Update UI to show "Find Match" or "Play Again".
 });
 ```
+
+---
+
+## Private Lobby Flow (Invite-Only)
+
+Private lobbies are separate from the public queue and never auto-fill. A lobby is created with game rules, returns a lobby ID, and players join using that ID. The admin manually starts the match when the lobby is full and all players are connected.
+Players can join a lobby while it is in a game as long as the lobby is not full; they will wait for the next start.
+Players in a private lobby must leave it before joining the public queue.
+
+Config rules:
+- Dice: `{ playerCount, turnTimeMs }`
+- TicTacToe: `{ turnDurationSec }`
+- Card: `{ playerCount, turnDurationSec }`
+
+Private lobbies close when idle for `PRIVATE_LOBBY_IDLE_MS`, or when empty for longer than `PRIVATE_LOBBY_EMPTY_GRACE_MS` (timers pause during active games).
+
+### Create Private Lobby
+
+```javascript
+socket.emit('create-private-lobby', {
+    playerId: 'user-12345-abcdef',
+    playerName: 'Alice',
+    gameType: 'card',
+    config: {
+        playerCount: 4,
+        turnDurationSec: 12
+    },
+    deviceId: 'device-uuid'
+});
+```
+
+Server responds with `private-lobby-created` and a full lobby snapshot.
+
+### Join Private Lobby
+
+```javascript
+socket.emit('join-private-lobby', {
+    lobbyId: 'lobby-uuid',
+    playerId: 'user-2222',
+    playerName: 'Bob',
+    deviceId: 'device-xyz'
+});
+```
+
+### Leave / Kick
+
+```javascript
+socket.emit('leave-private-lobby', { lobbyId, playerId });
+socket.emit('kick-private-lobby', { lobbyId, playerId, targetPlayerId });
+```
+
+### Start Private Lobby (Admin Only)
+
+```javascript
+socket.emit('start-private-lobby', { lobbyId, playerId });
+```
+
+When the session is created, each lobby member receives `match-found` with `sessionId` + `joinUrl`.
+
+### Lobby Events
+
+- `private-lobby-created` → lobby snapshot (creator only)
+- `private-lobby-joined` → lobby snapshot (joining player)
+- `private-lobby-updated` → broadcast to lobby room
+- `private-lobby-left` → acknowledgement for leaver
+- `private-lobby-kicked` → target was removed
+- `private-lobby-closed` → lobby expired/closed (idle or empty)
 
 ---
 
