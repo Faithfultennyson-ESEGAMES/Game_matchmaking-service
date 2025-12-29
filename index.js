@@ -22,7 +22,12 @@ const REDIS_USERNAME = process.env.REDIS_USERNAME;
 const REDIS_PASSWORD = process.env.REDIS_PASSWORD;
 const REDIS_USE_TLS = String(process.env.REDIS_USE_TLS || 'true').toLowerCase() === 'true';
 const AUTH_REQUIRED = String(process.env.AUTH_REQUIRED || 'false').toLowerCase() === 'true';
-const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_JWKS_URL = process.env.SUPABASE_JWKS_URL
+    || (SUPABASE_URL ? `${SUPABASE_URL.replace(/\/$/, '')}/auth/v1/.well-known/jwks.json` : null);
+const SUPABASE_JWT_ISSUER = process.env.SUPABASE_JWT_ISSUER
+    || (SUPABASE_URL ? `${SUPABASE_URL.replace(/\/$/, '')}/auth/v1` : null);
+const SUPABASE_JWT_AUDIENCE = process.env.SUPABASE_JWT_AUDIENCE || 'authenticated';
 const DICE_TURN_TIME_MS = parseInt(process.env.DICE_TURN_TIME_MS, 10) || 8000;
 const TICTACTOE_TURN_DURATION_SEC = parseInt(process.env.TICTACTOE_TURN_DURATION_SEC, 10) || 6;
 const CARD_TURN_DURATION_SEC = parseInt(process.env.CARD_TURN_DURATION_SEC, 10) || 10;
@@ -49,8 +54,8 @@ if (!REDIS_URL && (!REDIS_HOST || !REDIS_PORT)) {
     process.exit(1);
 }
 
-if (AUTH_REQUIRED && !SUPABASE_JWT_SECRET) {
-    console.error('FATAL ERROR: AUTH_REQUIRED is true but SUPABASE_JWT_SECRET is missing.');
+if (AUTH_REQUIRED && (!SUPABASE_JWKS_URL || !SUPABASE_JWT_ISSUER)) {
+    console.error('FATAL ERROR: AUTH_REQUIRED is true but SUPABASE_URL/SUPABASE_JWKS_URL or SUPABASE_JWT_ISSUER is missing.');
     process.exit(1);
 }
 
@@ -76,15 +81,20 @@ const io = new Server(server, {
 });
 
 if (AUTH_REQUIRED) {
-    io.use((socket, next) => {
-        const token = getSocketAuthToken(socket);
-        const result = verifySupabaseJwt(token);
-        if (!result.ok) {
-            console.warn('[Auth] Socket connection rejected:', result.reason);
+    io.use(async (socket, next) => {
+        try {
+            const token = getSocketAuthToken(socket);
+            const result = await verifySupabaseJwt(token);
+            if (!result.ok) {
+                console.warn('[Auth] Socket connection rejected:', result.reason);
+                return next(new Error('unauthorized'));
+            }
+            socket.auth = { userId: result.payload?.sub || null };
+            return next();
+        } catch (error) {
+            console.warn('[Auth] Socket connection rejected:', error?.message || error);
             return next(new Error('unauthorized'));
         }
-        socket.auth = { userId: result.payload?.sub || null };
-        return next();
     });
 }
 
@@ -211,18 +221,21 @@ function normalizeMode(gameType, mode) {
     return DICE_MODES.includes(parsed) ? parsed : null;
 }
 
-function base64UrlEncode(buffer) {
-    return Buffer.from(buffer)
-        .toString('base64')
-        .replace(/=/g, '')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_');
+let josePromise = null;
+let jwksCache = null;
+
+function getJose() {
+    if (!josePromise) {
+        josePromise = import('jose');
+    }
+    return josePromise;
 }
 
-function base64UrlDecode(value) {
-    const safe = (value || '').replace(/-/g, '+').replace(/_/g, '/');
-    const padded = safe.padEnd(safe.length + (4 - (safe.length % 4 || 4)), '=');
-    return Buffer.from(padded, 'base64').toString('utf8');
+async function getJwks() {
+    if (jwksCache) return jwksCache;
+    const { createRemoteJWKSet } = await getJose();
+    jwksCache = createRemoteJWKSet(new URL(SUPABASE_JWKS_URL));
+    return jwksCache;
 }
 
 function getSocketAuthToken(socket) {
@@ -235,48 +248,22 @@ function getSocketAuthToken(socket) {
     return null;
 }
 
-function verifySupabaseJwt(token) {
-    if (!token || !SUPABASE_JWT_SECRET) {
+async function verifySupabaseJwt(token) {
+    if (!token) {
         return { ok: false, reason: 'missing_token' };
     }
 
-    const parts = token.split('.');
-    if (parts.length !== 3) {
-        return { ok: false, reason: 'malformed_token' };
-    }
-
-    const [headerB64, payloadB64, signatureB64] = parts;
-    let header = null;
-    let payload = null;
-
     try {
-        header = JSON.parse(base64UrlDecode(headerB64));
-        payload = JSON.parse(base64UrlDecode(payloadB64));
+        const { jwtVerify } = await getJose();
+        const jwks = await getJwks();
+        const { payload } = await jwtVerify(token, jwks, {
+            issuer: SUPABASE_JWT_ISSUER,
+            audience: SUPABASE_JWT_AUDIENCE
+        });
+        return { ok: true, payload };
     } catch (error) {
-        return { ok: false, reason: 'invalid_token_json' };
+        return { ok: false, reason: error?.message || 'invalid_token' };
     }
-
-    if (!header || header.alg !== 'HS256') {
-        return { ok: false, reason: 'unsupported_alg' };
-    }
-
-    const expected = base64UrlEncode(
-        crypto.createHmac('sha256', SUPABASE_JWT_SECRET).update(`${headerB64}.${payloadB64}`).digest()
-    );
-
-    if (expected.length !== signatureB64.length) {
-        return { ok: false, reason: 'invalid_signature' };
-    }
-
-    if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signatureB64))) {
-        return { ok: false, reason: 'invalid_signature' };
-    }
-
-    if (payload && payload.exp && Date.now() >= payload.exp * 1000) {
-        return { ok: false, reason: 'token_expired' };
-    }
-
-    return { ok: true, payload };
 }
 
 function getClientIp(socket) {
