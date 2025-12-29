@@ -13,9 +13,12 @@ import { io } from "socket.io-client";
 
 const socket = io("https://your-matchmaking-host", {
   transports: ["websocket", "polling"],
-  reconnection: true
+  reconnection: true,
+  auth: { token: supabaseJwt } // required when AUTH_REQUIRED=true
 });
 ```
+
+If `AUTH_REQUIRED=true` on the server, connections without a valid Supabase JWT are rejected.
 
 ### Required Player Fields
 Every request must include:
@@ -57,7 +60,8 @@ Payload:
   "sessionId": "uuid",
   "joinUrl": "http://game-server/session/<id>/join",
   "gameType": "card",
-  "mode": 4
+  "mode": 4,
+  "voiceChannel": "session_<id>"
 }
 ```
 
@@ -77,6 +81,7 @@ socket.on("match-found", (data) => {
   window.location.href = url.toString();
 });
 ```
+`voiceChannel` is included for voice chat on public matches. Private lobbies provide `voiceChannel` on lobby snapshots (`lobby_<lobbyId>`), so `match-found` may omit it for lobby-started games.
 
 ### `match-error`
 The server sends this when input is invalid, cooldown is active, or session creation fails.
@@ -107,6 +112,7 @@ Emitted when the game ends (from webhook). Includes player outcome.
 ```json
 {
   "sessionId": "uuid",
+  "gameType": "card",
   "outcome": "win"
 }
 ```
@@ -220,6 +226,8 @@ socket.emit("kick-private-lobby", { lobbyId, playerId, targetPlayerId });
 - `private-lobby-left` → acknowledgement for leaver
 - `private-lobby-kicked` → target removed
 - `private-lobby-closed` → lobby expired (idle/empty)
+
+Lobby snapshots include `voiceChannel` for the lobby (e.g. `lobby_<lobbyId>`).
 
 Idle timers pause while a lobby is in an active game, and resume after the game ends.
 Players can still join a lobby while it is in a game as long as the lobby is not full; they will wait for the next start.

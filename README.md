@@ -9,7 +9,7 @@ This Node.js application is the central matchmaking service for the ESEGAMES pla
 3.  **Queuing**: The player is added to a queue. When the required number of players for that mode is present, a match is formed.
 4.  **Session Creation**: The server sends a signed, server-to-server `POST` request to the appropriate game server (`dice`, `tictactoe`, or `card`) `/start` endpoint using the selected mode. For dice/card, the payload includes `playerCount`.
 5.  **Receive Game Details**: The `game-server` responds with a `sessionId` and a `joinUrl`. This response is verified using a shared HMAC secret.
-6.  **Notify Players**: The server emits a `match-found` event to both players, providing the `sessionId` and `joinUrl`.
+6.  **Notify Players**: The server emits a `match-found` event to both players, providing the `sessionId` and `joinUrl`. Public matches include `voiceChannel`; private lobbies use the lobby snapshot `voiceChannel`.
 7.  **Client Redirect**: The clients construct the final game URL using the received data and redirect the players to the game client.
 8.  **Session Closure**: After the game ends, the `game-server` sends a `POST /session-closed` webhook back to this server.
 9.  **State Cleanup**: This server validates the webhook, removes the players from the active games list, and emits a `session-ended` event to notify the clients (including win/loss/draw).
@@ -68,6 +68,10 @@ SESSION_CREATION_RETRY_DELAY_MS=1500
 DB_ENTRY_TTL_MS=3600000
 ACTIVE_GAMES_TTL_MS=3600000
 
+# --- Auth (optional) ---
+AUTH_REQUIRED=false
+SUPABASE_JWT_SECRET=your_supabase_jwt_secret
+
 # --- Private Lobby Settings ---
 PRIVATE_LOBBY_IDLE_MS=1800000
 PRIVATE_LOBBY_EMPTY_GRACE_MS=60000
@@ -106,7 +110,11 @@ Clients must use Socket.IO to connect and interact with this server. For a deepe
 ```javascript
 import { io } from "socket.io-client";
 
-const socket = io("https://tictac-toematchmaking-service-production.up.railway.app"); // Your matchmaking server URL
+const socket = io("https://tictac-toematchmaking-service-production.up.railway.app", {
+  auth: { token: supabaseJwt }
+}); // Your matchmaking server URL
+
+If `AUTH_REQUIRED=true`, clients must include a valid Supabase JWT in the Socket.IO handshake.
 
 const playerDetails = {
     playerId: 'user-12345-abcdef', // A unique, stable identifier
@@ -145,7 +153,8 @@ socket.on('match-found', (data) => {
     //   sessionId: "d2c1ba68-ab40-46b5-9651-b48ed4cb8069",
     //   joinUrl: "http://game-server:5500/session/d2c1ba68-ab40-46b5-9651-b48ed4cb8069/join",
     //   gameType: "dice",
-    //   mode: 4
+    //   mode: 4,
+    //   voiceChannel: "session_d2c1ba68-ab40-46b5-9651-b48ed4cb8069"
     // }
 
     // IMPORTANT: Construct the URL for your game client, passing the details.
@@ -184,7 +193,7 @@ socket.emit('cancel-match', { playerId: 'user-12345-abcdef', deviceId: 'device-u
 ```javascript
 socket.on('session-ended', (data) => {
     console.log(`Session ${data.sessionId} has ended (${data.outcome}).`);
-    // data = { sessionId: "...", outcome: "win" | "loss" | "draw" }
+    // data = { sessionId: "...", gameType: "dice" | "card" | "tictactoe", outcome: "win" | "loss" | "draw" }
 
     // Update the UI to allow the user to start a new match search.
 });
@@ -312,7 +321,7 @@ socket.emit('kick-private-lobby', { lobbyId, playerId, targetPlayerId });
 socket.emit('start-private-lobby', { lobbyId, playerId });
 ```
 
-When the session is created, each lobby member receives `match-found` with `sessionId` + `joinUrl`.
+When the session is created, each lobby member receives `match-found` with `sessionId` and `joinUrl`. Use the lobby snapshot `voiceChannel` for voice chat.
 
 ### Lobby Events
 
@@ -322,6 +331,8 @@ When the session is created, each lobby member receives `match-found` with `sess
 - `private-lobby-left` → acknowledgement for leaver
 - `private-lobby-kicked` → target was removed
 - `private-lobby-closed` → lobby expired/closed (idle or empty)
+
+Lobby snapshots include `voiceChannel` for the lobby (e.g. `lobby_<lobbyId>`).
 
 ---
 
