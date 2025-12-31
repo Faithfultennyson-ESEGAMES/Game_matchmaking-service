@@ -40,6 +40,7 @@ const MAX_CANCEL_JOIN = parseInt(process.env.MAX_CANCEL_JOIN, 10) || 8;
 const COOLDOWN_MS = parseInt(process.env.COOLDOWN_MS, 10) || 60000;
 const PRIVATE_LOBBY_IDLE_MS = parseInt(process.env.PRIVATE_LOBBY_IDLE_MS, 10) || 1800000;
 const PRIVATE_LOBBY_EMPTY_GRACE_MS = parseInt(process.env.PRIVATE_LOBBY_EMPTY_GRACE_MS, 10) || 60000;
+const PRIVATE_LOBBY_DISCONNECT_GRACE_MS = parseInt(process.env.PRIVATE_LOBBY_DISCONNECT_GRACE_MS, 10) || 120000;
 const DICE_MODES = [2, 4, 6, 15];
 const CARD_MODES = [2, 3, 4, 5, 6];
 const CLEANUP_INTERVAL_MS = Math.min(300000, DB_ENTRY_TTL_MS);
@@ -214,6 +215,7 @@ const getPrivateLobbyPlayerKey = (playerId) => `private_lobby:player:${playerId}
 const getPrivateLobbySessionKey = (sessionId) => `private_lobby:session:${sessionId}`;
 const getPrivateLobbySocketKey = (socketId) => `private_lobby:socket:${socketId}`;
 const getPrivateLobbyPlayerSocketKey = (playerId) => `private_lobby:player_socket:${playerId}`;
+const getPrivateLobbyDisconnectKey = (playerId) => `private_lobby:disconnect:${playerId}`;
 const getPrivateLobbyRoom = (lobbyId) => `private-lobby:${lobbyId}`;
 
 function normalizeGameType(raw) {
@@ -436,6 +438,31 @@ async function emitLobbyUpdate(lobbyId) {
     const state = await buildLobbyState(lobbyId);
     if (!state) return;
     io.to(getPrivateLobbyRoom(lobbyId)).emit('private-lobby-updated', state);
+}
+
+async function hydrateLobbyForSocket(socket, playerId) {
+    if (!playerId) return;
+    const lobbyId = await redisClient.get(getPrivateLobbyPlayerKey(playerId));
+    if (!lobbyId) return;
+
+    const lobby = await loadLobby(lobbyId);
+    if (!lobby) return;
+
+    const previousSocketId = await redisClient.get(getPrivateLobbyPlayerSocketKey(playerId));
+    if (previousSocketId && previousSocketId !== socket.id) {
+        await redisClient.del(getPrivateLobbySocketKey(previousSocketId));
+    }
+
+    await redisClient.set(getPrivateLobbySocketKey(socket.id), JSON.stringify({ lobbyId, playerId }), { PX: DB_ENTRY_TTL_MS });
+    await redisClient.set(getPrivateLobbyPlayerSocketKey(playerId), socket.id, { PX: DB_ENTRY_TTL_MS });
+    await redisClient.sAdd(getPrivateLobbyConnectedKey(lobbyId), playerId);
+    await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
+    socket.join(getPrivateLobbyRoom(lobbyId));
+
+    const state = await buildLobbyState(lobbyId);
+    if (state) {
+        socket.emit('private-lobby-joined', state);
+    }
 }
 
 async function removePlayerFromLobby(lobbyId, playerId, { kicked = false } = {}) {
@@ -742,7 +769,28 @@ async function cleanupStaleEntries() {
         }
 
         const lobbyId = lobby.lobbyId;
-        const connectedCount = await redisClient.sCard(getPrivateLobbyConnectedKey(lobbyId));
+        const playerMap = await redisClient.hGetAll(getPrivateLobbyPlayersKey(lobbyId));
+        const connectedIds = new Set(await redisClient.sMembers(getPrivateLobbyConnectedKey(lobbyId)));
+        const connectedCount = connectedIds.size;
+
+        for (const playerId of Object.keys(playerMap)) {
+            if (connectedIds.has(playerId)) {
+                await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
+                continue;
+            }
+            const disconnectKey = getPrivateLobbyDisconnectKey(playerId);
+            const raw = await redisClient.get(disconnectKey);
+            if (!raw) {
+                await redisClient.set(disconnectKey, String(now), { PX: DB_ENTRY_TTL_MS });
+                continue;
+            }
+            const disconnectedAt = parseInt(raw, 10);
+            if (disconnectedAt && now - disconnectedAt > PRIVATE_LOBBY_DISCONNECT_GRACE_MS) {
+                await removePlayerFromLobby(lobbyId, playerId);
+                await redisClient.del(disconnectKey);
+            }
+        }
+
         if (connectedCount === 0) {
             const emptySince = lobby.emptySince ? new Date(lobby.emptySince).getTime() : 0;
             if (!emptySince) {
@@ -1101,6 +1149,15 @@ async function main() {
                 console.error('[Socket] Failed to send initial queue status:', err.message);
             });
 
+        const handshakePlayerId =
+            socket.handshake.auth?.playerId
+            || socket.handshake.query?.playerId
+            || socket.handshake.headers['x-player-id'];
+        if (handshakePlayerId) {
+            hydrateLobbyForSocket(socket, handshakePlayerId)
+                .catch((err) => console.error('[Socket] Lobby hydrate failed:', err.message));
+        }
+
         socket.on('request-match', async (data) => {
             try {
                 const { playerId, playerName, gameType: rawGameType, mode: rawMode, deviceId } = data || {};
@@ -1286,6 +1343,8 @@ async function main() {
                 await redisClient.set(getPrivateLobbyPlayerKey(playerId), lobbyId, { PX: DB_ENTRY_TTL_MS });
                 await redisClient.set(getPrivateLobbyPlayerSocketKey(playerId), socket.id, { PX: DB_ENTRY_TTL_MS });
                 await redisClient.set(getPrivateLobbySocketKey(socket.id), JSON.stringify({ lobbyId, playerId }), { PX: DB_ENTRY_TTL_MS });
+                await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
+                await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
 
                 await touchPrivateLobbyKeys(lobbyId);
 
@@ -1404,17 +1463,19 @@ async function main() {
 
         socket.on('leave-private-lobby', async (data) => {
             try {
-                const { lobbyId, playerId } = data || {};
-                if (!lobbyId || !playerId) {
-                    return socket.emit('match-error', { message: 'lobbyId and playerId are required.' });
+                const { lobbyId: requestedLobbyId, playerId } = data || {};
+                if (!playerId) {
+                    return socket.emit('match-error', { message: 'playerId is required.' });
                 }
 
                 const currentLobbyId = await redisClient.get(getPrivateLobbyPlayerKey(playerId));
-                if (!currentLobbyId || currentLobbyId !== lobbyId) {
+                const lobbyId = requestedLobbyId || currentLobbyId;
+                if (!lobbyId || !currentLobbyId || currentLobbyId !== lobbyId) {
                     return socket.emit('match-error', { message: 'You are not in that private lobby.' });
                 }
 
                 await removePlayerFromLobby(lobbyId, playerId);
+                await redisClient.del(getPrivateLobbyDisconnectKey(playerId));
                 socket.leave(getPrivateLobbyRoom(lobbyId));
                 socket.emit('private-lobby-left', { lobbyId, playerId });
             } catch (err) {
@@ -1574,6 +1635,7 @@ async function main() {
                 await redisClient.del(getPrivateLobbySocketKey(socket.id));
                 await redisClient.del(getPrivateLobbyPlayerSocketKey(lobbySocket.playerId));
                 await redisClient.sRem(getPrivateLobbyConnectedKey(lobbySocket.lobbyId), lobbySocket.playerId);
+                await redisClient.set(getPrivateLobbyDisconnectKey(lobbySocket.playerId), String(Date.now()), { PX: DB_ENTRY_TTL_MS });
 
                 const lobby = await loadLobby(lobbySocket.lobbyId);
                 if (lobby && !lobby.inGame) {
